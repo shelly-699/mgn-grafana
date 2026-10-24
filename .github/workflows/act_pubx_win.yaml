@@ -1,4 +1,4 @@
-# act-pubx-workflow: v5 variant=plain sha256=1e8ecd78583ed076
+# act-pubx-workflow: v5 variant=plain sha256=a62a18bede685769
 name: actx windows session
 
 on:
@@ -248,6 +248,8 @@ jobs:
           else
             IV=0
           fi
+          ( tail -n +1 -F "$D/session.log" 2>/dev/null | grep --line-buffered '^actx: stage ' ) &
+          TP=$!
           n=0
           while alive; do
             if [ "$IV" -gt 0 ] && [ "$(date +%s)" -ge "$next" ]; then
@@ -258,6 +260,7 @@ jobs:
             fi
             sleep 5
           done
+          kill "$TP" 2>/dev/null || true
           echo "会话已结束"
           exit 0
 
