@@ -1,4 +1,4 @@
-# act-pubx-workflow: v5 variant=plain sha256=b3ab329a6b05720f
+# act-pubx-workflow: v5 variant=plain sha256=2f2b37c087a231f2
 name: act-pubx session runner
 
 on:
@@ -14,7 +14,7 @@ on:
       timeout:
         description: '有效工作时长(分钟)'
         required: false
-        default: '240'
+        default: '60'
       job_timeout:
         description: 'job 硬上限(分钟)'
         required: false
@@ -84,19 +84,22 @@ jobs:
 
       - name: 启动会话
         env:
-          WORK_MIN: ${{ github.event.inputs.timeout || 240 }}
+          WORK_MIN: ${{ github.event.inputs.timeout || 60 }}
+          JOB_MIN: ${{ github.event.inputs.job_timeout || 260 }}
         run: |
           set -uo pipefail
-          case "$WORK_MIN" in ''|*[!0-9]*) WORK_MIN=240 ;; esac
-          if [ "$WORK_MIN" -gt 340 ]; then
-            echo "warn: 有效时长 ${WORK_MIN}min 超出 340(6h 硬上限留 20min 备份), 收敛为 340"
-            WORK_MIN=340
-          fi
+          case "$WORK_MIN" in ''|*[!0-9]*) WORK_MIN=60 ;; esac
+          case "$JOB_MIN" in ''|*[!0-9]*) JOB_MIN=260 ;; esac
           [ "$WORK_MIN" -lt 1 ] && WORK_MIN=1
-          SOFT_SEC=$(( WORK_MIN * 60 ))
+          SOFT_MIN=$(( JOB_MIN - 20 ))
+          if [ "$WORK_MIN" -gt "$SOFT_MIN" ]; then
+            echo "warn: 有效时长 ${WORK_MIN}min 超过 job 上限 ${JOB_MIN}min(已留 20min 归档) → 实际活不到那时"
+            SOFT_MIN=$WORK_MIN
+          fi
+          SOFT_SEC=$(( SOFT_MIN * 60 ))
           D="$RUNNER_TEMP/actx"
           export ACTX_LOG_FILE="$D/session.log"
-          echo "软超时 ${SOFT_SEC}s (有效时长 ${WORK_MIN}min; job 上限另留 20min 给缓存归档)"
+          echo "安全网 ${SOFT_MIN}min (job 上限 ${JOB_MIN}min; 有效时长 ${WORK_MIN}min 由保活循环判, 有人连着不收工)"
           nohup bash -c "timeout -k 60 $SOFT_SEC bash '$D/p.sh'; echo \$? > '$D/session.rc'" \
             > "$D/session.log" 2>&1 < /dev/null &
           echo $! > "$D/session.pid"
