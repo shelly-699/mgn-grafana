@@ -1,4 +1,4 @@
-# act-pubx-workflow: v5 variant=plain sha256=2f2b37c087a231f2
+# act-pubx-workflow: v5 variant=plain sha256=aed44beb45013fd6
 name: act-pubx session runner
 
 on:
@@ -174,10 +174,13 @@ jobs:
             chmod +x "$B"
           fi
           mkdir -p /tmp/storage
-          "$B" restore /tmp/storage --tag "$GRP"
+          "$B" restore /tmp --tag "$GRP"
           rc=$?
+          if [ -d "/tmp/$GRP" ] && [ -z "$(ls -A /tmp/storage 2>/dev/null)" ]; then
+            mv "/tmp/$GRP" /tmp/storage 2>/dev/null && echo "↪ 老快照的 /tmp/$GRP 已搬到 /tmp/storage"
+          fi
           case "$rc" in
-            0) echo "✓ 组存储已就位: /tmp/storage/$GRP"
+            0) echo "✓ 组存储已就位: /tmp/storage"
                : > "$RUNNER_TEMP/actx/grp_restore_ok" ;;
             4) echo "组 '$GRP' 还没有快照(首次) → 从空开始"
                : > "$RUNNER_TEMP/actx/grp_restore_ok" ;;
@@ -203,9 +206,9 @@ jobs:
             echo "::error::组存储[$LBL]: 本次开工时**没恢复成功** → 不推送(否则会把别人的快照覆盖成空的)。本轮的改动不会被保存。"
             exit 3
           fi
-          D="/tmp/storage/$GRP"
-          if [ ! -d "$D" ]; then
-            echo "::warning::组存储[$LBL]: 没有 $D (会话没往组存储里写东西) → 不推"
+          D="/tmp/storage"
+          if [ ! -d "$D" ] || [ -z "$(ls -A "$D" 2>/dev/null)" ]; then
+            echo "::warning::组存储[$LBL]: $D 是空的(会话没往组存储里写东西) → 不推"
             exit 4
           fi
           B="$A/oci-store"
