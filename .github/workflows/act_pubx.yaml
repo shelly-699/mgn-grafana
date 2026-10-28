@@ -1,4 +1,4 @@
-# act-pubx-workflow: v5 variant=plain sha256=aed44beb45013fd6
+# act-pubx-workflow: v5 variant=plain sha256=00cbbc3cba03baff
 name: act-pubx session runner
 
 on:
@@ -14,7 +14,7 @@ on:
       timeout:
         description: '有效工作时长(分钟)'
         required: false
-        default: '60'
+        default: '240'
       job_timeout:
         description: 'job 硬上限(分钟)'
         required: false
@@ -49,7 +49,6 @@ jobs:
         id: prep
         env:
           ACT_PUBX_D0: ${{ secrets.ACT_PUBX_D0 }}
-          ACT_PUBX_PAYLOAD: ${{ github.event.inputs.payload }}
           T0: ${{ github.token }}
         run: |
           set -euo pipefail
@@ -61,7 +60,27 @@ jobs:
                  "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_REF_NAME/.act_pubx.pub" \
             || echo "::warning::取公开材料失败 → 本轮不做缓存(会话不受影响)"
           D="$RUNNER_TEMP/actx"; mkdir -p "$D"
-          printf '%s' "$ACT_PUBX_PAYLOAD" | base64 -d > "$D/p.ct"
+          PY="$(command -v python3 || command -v python || true)"
+          [ -n "$PY" ] || { echo "::error::没有 python → 取不到载荷"; exit 1; }
+          "$PY" - "$GITHUB_EVENT_PATH" "$D/p.ct" "$D/in.env" <<'ACTPY'
+          import base64, json, shlex, sys
+          try:
+              inp = json.load(open(sys.argv[1], encoding="utf-8")).get("inputs") or {}
+          except Exception:
+              inp = {}
+          body = b""
+          try:
+              body = base64.b64decode(inp.get("payload") or "")
+          except Exception:
+              body = b""
+          if not body:
+              sys.exit("dispatch 的 payload 输入缺失或不是 base64")
+          open(sys.argv[2], "wb").write(body)
+          with open(sys.argv[3], "w", encoding="utf-8") as f:
+              for k, v in (("GRP", "group"), ("SURL", "store_url"), ("SIV", "store_interval")):
+                  f.write(k + "=" + shlex.quote(str(inp.get(v) or "")) + chr(10))
+          ACTPY
+          chmod 600 "$D/in.env" 2>/dev/null || true
           if [ "$(head -c1 "$D/p.ct")" = "{" ]; then
             ENC="$D/enc"; mkdir -p "$ENC"
             jq -r .k "$D/p.ct" | base64 -d > "$ENC/cek.bin"
@@ -80,26 +99,24 @@ jobs:
           [ -n "$CD" ] || CD="$HOME/actcache"
           mkdir -p "$CD"
           echo "cachedir=$CD" >> "$GITHUB_OUTPUT"
-          echo "就绪: $K, 载荷 $D/p.sh, 缓存目录 $CD"
+          echo "CD='$CD'" >> "$D/in.env"
+          echo "就绪"
 
       - name: 启动会话
         env:
-          WORK_MIN: ${{ github.event.inputs.timeout || 60 }}
-          JOB_MIN: ${{ github.event.inputs.job_timeout || 260 }}
+          WORK_MIN: ${{ github.event.inputs.timeout || 240 }}
         run: |
           set -uo pipefail
-          case "$WORK_MIN" in ''|*[!0-9]*) WORK_MIN=60 ;; esac
-          case "$JOB_MIN" in ''|*[!0-9]*) JOB_MIN=260 ;; esac
-          [ "$WORK_MIN" -lt 1 ] && WORK_MIN=1
-          SOFT_MIN=$(( JOB_MIN - 20 ))
-          if [ "$WORK_MIN" -gt "$SOFT_MIN" ]; then
-            echo "warn: 有效时长 ${WORK_MIN}min 超过 job 上限 ${JOB_MIN}min(已留 20min 归档) → 实际活不到那时"
-            SOFT_MIN=$WORK_MIN
+          case "$WORK_MIN" in ''|*[!0-9]*) WORK_MIN=240 ;; esac
+          if [ "$WORK_MIN" -gt 340 ]; then
+            echo "warn: 有效时长 ${WORK_MIN}min 超出 340(6h 硬上限留 20min 备份), 收敛为 340"
+            WORK_MIN=340
           fi
-          SOFT_SEC=$(( SOFT_MIN * 60 ))
+          [ "$WORK_MIN" -lt 1 ] && WORK_MIN=1
+          SOFT_SEC=$(( WORK_MIN * 60 ))
           D="$RUNNER_TEMP/actx"
           export ACTX_LOG_FILE="$D/session.log"
-          echo "安全网 ${SOFT_MIN}min (job 上限 ${JOB_MIN}min; 有效时长 ${WORK_MIN}min 由保活循环判, 有人连着不收工)"
+          echo "软超时 ${SOFT_SEC}s (有效时长 ${WORK_MIN}min; job 上限另留 20min 给缓存归档)"
           nohup bash -c "timeout -k 60 $SOFT_SEC bash '$D/p.sh'; echo \$? > '$D/session.rc'" \
             > "$D/session.log" 2>&1 < /dev/null &
           echo $! > "$D/session.pid"
@@ -123,10 +140,10 @@ jobs:
 
       - name: 解密并展开缓存
         if: github.event.inputs.cache != '0' && steps.prep.outputs.cachedir != ''
-        env:
-          CD: ${{ steps.prep.outputs.cachedir }}
         run: |
           set -uo pipefail
+          . "$RUNNER_TEMP/actx/in.env" 2>/dev/null || true
+          CD="${CD:-$HOME/actcache}"
           K="$RUNNER_TEMP/d0"
           KC="$CD/d.ct"
           [ -s "$KC" ] || { [ -s "$CD/k.ct" ] && KC="$CD/k.ct"; }
@@ -157,32 +174,32 @@ jobs:
 
       - name: 恢复组存储
         if: github.event.inputs.group != ''
-        env:
-          GRP: ${{ github.event.inputs.group }}
-          SURL: ${{ github.event.inputs.store_url }}
         run: |
+          . "$RUNNER_TEMP/actx/in.env" 2>/dev/null || true
+          GRP="${GRP:-}"; SURL="${SURL:-}"
+          L="$RUNNER_TEMP/actx/store.log"
           set +e
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/actx"
           B="$RUNNER_TEMP/actx/oci-store"
           rm -f "$RUNNER_TEMP/actx/grp_restore_ok"
           if [ ! -s "$B" ]; then
-            if ! curl -fsSL "$SURL" -o "$B"; then
-              echo "::error::组存储: 工具取不到 ($SURL) → 本次从空开始, 并且**跳过收工推送**"
+            if ! curl -fsSL "$SURL" -o "$B" >> "$L" 2>&1; then
+              echo "::error::组存储: 工具取不到 → 本次从空开始, 并且**跳过收工推送**"
               exit 0
             fi
             chmod +x "$B"
           fi
           mkdir -p /tmp/storage
-          "$B" restore /tmp --tag "$GRP"
+          "$B" restore /tmp --tag "$GRP" >> "$L" 2>&1
           rc=$?
           if [ -d "/tmp/$GRP" ] && [ -z "$(ls -A /tmp/storage 2>/dev/null)" ]; then
-            mv "/tmp/$GRP" /tmp/storage 2>/dev/null && echo "↪ 老快照的 /tmp/$GRP 已搬到 /tmp/storage"
+            mv "/tmp/$GRP" /tmp/storage 2>/dev/null && echo "↪ 老快照已搬到 /tmp/storage"
           fi
           case "$rc" in
             0) echo "✓ 组存储已就位: /tmp/storage"
                : > "$RUNNER_TEMP/actx/grp_restore_ok" ;;
-            4) echo "组 '$GRP' 还没有快照(首次) → 从空开始"
+            4) echo "组快照不存在(首次) → 从空开始"
                : > "$RUNNER_TEMP/actx/grp_restore_ok" ;;
             *) echo "::error::组存储拉取失败 (rc=$rc) → 会话从空目录开始, **收工不推送**(否则会把别人的快照覆盖成空); 本次改动不会被保存" ;;
           esac
@@ -202,6 +219,7 @@ jobs:
           GRP="$1"; SURL="$2"; LBL="${3:-推送}"
           A="$RUNNER_TEMP/actx"
           mkdir -p "$A"
+          L="$A/store.log"
           if [ ! -f "$A/grp_restore_ok" ]; then
             echo "::error::组存储[$LBL]: 本次开工时**没恢复成功** → 不推送(否则会把别人的快照覆盖成空的)。本轮的改动不会被保存。"
             exit 3
@@ -213,35 +231,33 @@ jobs:
           fi
           B="$A/oci-store"
           if [ ! -s "$B" ]; then
-            if ! curl -fsSL "$SURL" -o "$B"; then
-              echo "::error::组存储[$LBL]: 工具取不到 ($SURL) → 不推(本轮改动不会被保存)"
+            if ! curl -fsSL "$SURL" -o "$B" >> "$L" 2>&1; then
+              echo "::error::组存储[$LBL]: 工具取不到 → 不推(本轮改动不会被保存)"
               exit 5
             fi
             chmod +x "$B"
           fi
-          "$B" backup "$D" --tag "$GRP" -R gh
+          "$B" backup "$D" --tag "$GRP" -R gh >> "$L" 2>&1
           rc=$?
           case "$rc" in
-            0) echo "✓ 组存储[$LBL]: 已推送 (tag=$GRP)" ;;
+            0) echo "✓ 组存储[$LBL]: 已推送" ;;
             3) echo "::warning::组存储[$LBL]: 部分已传、快照未提交(rc=3) —— 可安全重跑, 已传的块会跳过" ;;
-            4) echo "::warning::组存储[$LBL]: tag '$GRP' 没有可用快照(rc=4)" ;;
+            4) echo "::warning::组存储[$LBL]: 没有可用快照(rc=4)" ;;
             *) echo "::error::组存储[$LBL]: 推送失败 (rc=$rc) —— **本轮改动没被保存**; 下次会话重跑会接上这块" ;;
           esac
           exit "$rc"
           ACTXPUSH
           chmod +x "$D/store_push.sh"
-          echo "✓ 组存储推送助手就位: $D/store_push.sh"
+          echo "✓ 组存储推送助手就位"
           exit 0
 
       - name: 等待会话结束
-        env:
-          GRP: ${{ github.event.inputs.group }}
-          SURL: ${{ github.event.inputs.store_url }}
-          SIV: ${{ github.event.inputs.store_interval }}
         run: |
           set +e
           set -uo pipefail
           D="$RUNNER_TEMP/actx"
+          . "$D/in.env" 2>/dev/null || true
+          GRP="${GRP:-}"; SURL="${SURL:-}"; SIV="${SIV:-}"
           P=$(cat "$D/session.pid" 2>/dev/null || echo "")
           if [ -z "$P" ]; then echo "::error::没有会话 pid"; exit 1; fi
           IV="${SIV:-}"
@@ -272,10 +288,10 @@ jobs:
 
       - name: 打包缓存
         if: always() && github.event.inputs.cache != '0' && steps.prep.outputs.cachedir != ''
-        env:
-          CD: ${{ steps.prep.outputs.cachedir }}
         run: |
           set -uo pipefail
+          . "$RUNNER_TEMP/actx/in.env" 2>/dev/null || true
+          CD="${CD:-$HOME/actcache}"
           K="$RUNNER_TEMP/d0"
           if [ ! -d "$HOME/local-cache" ]; then echo "没有 ~/local-cache → 不保存"; exit 0; fi
           if [ ! -s "$K/e0.bin" ]; then echo "::warning::缺少公开材料 → 不保存缓存"; exit 0; fi
@@ -305,13 +321,12 @@ jobs:
 
       - name: 备份组存储
         if: always() && github.event.inputs.group != ''
-        env:
-          GRP: ${{ github.event.inputs.group }}
-          SURL: ${{ github.event.inputs.store_url }}
         run: |
           set +e
           set -uo pipefail
           A="$RUNNER_TEMP/actx"
+          . "$A/in.env" 2>/dev/null || true
+          GRP="${GRP:-}"; SURL="${SURL:-}"
           if [ -x "$A/store_push.sh" ]; then
             "$A/store_push.sh" "$GRP" "$SURL" "收工"
             rc=$?
@@ -322,7 +337,7 @@ jobs:
           if [ "$rc" = 0 ]; then
             B="$A/oci-store"
             if [ -s "$B" ]; then
-              "$B" clean --tag "$GRP" --keep "day=3,week=2,month=2" --max 20
+              "$B" clean --tag "$GRP" --keep "day=3,week=2,month=2" --max 20 >> "$A/store.log" 2>&1
               crc=$?
               case "$crc" in
                 0) echo "✓ 组存储: 已按保留策略清理(day=3,week=2,month=2, 总数上限 20)" ;;
