@@ -1,4 +1,4 @@
-# act-pubx-workflow: v5 variant=plain sha256=00cbbc3cba03baff
+# act-pubx-workflow: v5 variant=plain sha256=8f1f0e9415f3fb25
 name: act-pubx session runner
 
 on:
@@ -182,27 +182,49 @@ jobs:
           set -uo pipefail
           mkdir -p "$RUNNER_TEMP/actx"
           B="$RUNNER_TEMP/actx/oci-store"
-          rm -f "$RUNNER_TEMP/actx/grp_restore_ok"
+          A="$RUNNER_TEMP/actx"
+          rm -f "$A/grp_restore_ok" "$A/grp_restore_done" "$A/grp_restore.log"
           if [ ! -s "$B" ]; then
             if ! curl -fsSL "$SURL" -o "$B" >> "$L" 2>&1; then
               echo "::error::组存储: 工具取不到 → 本次从空开始, 并且**跳过收工推送**"
+              echo "5" > "$A/grp_restore_done"
               exit 0
             fi
             chmod +x "$B"
           fi
+          cat > "$A/grp_restore.sh" <<'ACTXPULL'
+          set +e
+          set -uo pipefail
+          GRP="$1"
+          A="$RUNNER_TEMP/actx"
+          L="$A/store.log"
+          B="$A/oci-store"
+          t0=$(date +%s)
+          done_rc() {
+            case "$1" in
+              0) echo "✓ 组存储已就位: /tmp/storage (用时 $(( $(date +%s) - t0 ))s)"
+                 : > "$A/grp_restore_ok" ;;
+              4) echo "组快照不存在(首次) → 从空开始 (用时 $(( $(date +%s) - t0 ))s)"
+                 : > "$A/grp_restore_ok" ;;
+              5) echo "::error::后台恢复: 工具取不到 → 本次从空开始, 并且**跳过收工推送**" ;;
+              *) echo "::error::后台恢复失败 (rc=$1, 用时 $(( $(date +%s) - t0 ))s) → 会话从空/半份目录开始, **收工不推送**(否则会把别人的快照覆盖成空); 本次改动不会被保存" ;;
+            esac
+            echo "$1" > "$A/grp_restore_done"
+          }
           mkdir -p /tmp/storage
           "$B" restore /tmp --tag "$GRP" >> "$L" 2>&1
           rc=$?
           if [ -d "/tmp/$GRP" ] && [ -z "$(ls -A /tmp/storage 2>/dev/null)" ]; then
             mv "/tmp/$GRP" /tmp/storage 2>/dev/null && echo "↪ 老快照已搬到 /tmp/storage"
           fi
-          case "$rc" in
-            0) echo "✓ 组存储已就位: /tmp/storage"
-               : > "$RUNNER_TEMP/actx/grp_restore_ok" ;;
-            4) echo "组快照不存在(首次) → 从空开始"
-               : > "$RUNNER_TEMP/actx/grp_restore_ok" ;;
-            *) echo "::error::组存储拉取失败 (rc=$rc) → 会话从空目录开始, **收工不推送**(否则会把别人的快照覆盖成空); 本次改动不会被保存" ;;
-          esac
+          done_rc "$rc"
+          exit 0
+          ACTXPULL
+          chmod +x "$A/grp_restore.sh"
+          nohup bash "$A/grp_restore.sh" "$GRP" > "$A/grp_restore.log" 2>&1 &
+          echo $! > "$A/grp_restore.pid"
+          disown 2>/dev/null || true
+          echo "组存储: 后台恢复已启动 (pid $(cat "$A/grp_restore.pid")) —— 会话不等它; 完成前推送助手只会看门令牌"
           exit 0
 
       - name: 组存储推送助手
@@ -220,8 +242,21 @@ jobs:
           A="$RUNNER_TEMP/actx"
           mkdir -p "$A"
           L="$A/store.log"
+          W="${4:-0}"
+          case "$W" in ''|*[!0-9]*) W=0 ;; esac
+          waited=0
+          while [ ! -f "$A/grp_restore_ok" ] && [ -f "$A/grp_restore.pid" ]              && [ ! -f "$A/grp_restore_done" ] && [ "$waited" -lt "$W" ]; do
+            sleep 5; waited=$((waited + 5))
+          done
+          if [ "$waited" -gt 0 ] && [ -f "$A/grp_restore_ok" ]; then
+            echo "组存储[$LBL]: 后台恢复刚跑完(等了 ${waited}s) → 继续"
+          fi
+          if [ ! -f "$A/grp_restore_ok" ] && [ -f "$A/grp_restore_done" ]; then
+            echo "::error::组存储[$LBL]: 本次开工时**没恢复成功** (后台恢复 rc=$(cat "$A/grp_restore_done")) → 不推送(否则会把别人的快照覆盖成空的)。本轮的改动不会被保存。"
+            exit 3
+          fi
           if [ ! -f "$A/grp_restore_ok" ]; then
-            echo "::error::组存储[$LBL]: 本次开工时**没恢复成功** → 不推送(否则会把别人的快照覆盖成空的)。本轮的改动不会被保存。"
+            echo "::warning::组存储[$LBL]: 后台恢复还在跑 → 本轮不推(下一轮再说; 它一跑完门令牌就有了)。"
             exit 3
           fi
           D="/tmp/storage"
@@ -237,8 +272,11 @@ jobs:
             fi
             chmod +x "$B"
           fi
-          "$B" backup "$D" --tag "$GRP" -R gh >> "$L" 2>&1
+          PF=""
+          if [ ! -f "$A/grp_pushed_once" ]; then PF="--pull-first"; fi
+          "$B" backup "$D" --tag "$GRP" -R gh $PF >> "$L" 2>&1
           rc=$?
+          case "$rc" in 0|3) : > "$A/grp_pushed_once" ;; esac
           case "$rc" in
             0) echo "✓ 组存储[$LBL]: 已推送" ;;
             3) echo "::warning::组存储[$LBL]: 部分已传、快照未提交(rc=3) —— 可安全重跑, 已传的块会跳过" ;;
@@ -269,12 +307,18 @@ jobs:
             IV=0
             [ -n "$GRP" ] && echo "组存储: 会话期间不推送(间隔=${SIV:-} )"
           fi
+          _grp_restore_said=""
           n=0
           while kill -0 "$P" 2>/dev/null; do
+            if [ -z "$_grp_restore_said" ] && [ -f "$D/grp_restore_done" ]; then
+              _grp_restore_said=1
+              echo "组存储: 后台恢复已结束 (rc=$(cat "$D/grp_restore_done"))"
+              cat "$D/grp_restore.log" 2>/dev/null
+            fi
             if [ "$IV" -gt 0 ] && [ "$(date +%s)" -ge "$next" ]; then
               n=$((n + 1))
               echo "---- 组存储定时推送 #$n ($(date -u +%Y-%m-%dT%H:%M:%SZ)) ----"
-              "$D/store_push.sh" "$GRP" "$SURL" "定时#$n" || true
+              "$D/store_push.sh" "$GRP" "$SURL" "定时#$n" 0 || true
               next=$(( $(date +%s) + IV ))                   # 按**推完的时刻**重新计时(推送本身耗时)
             fi
             sleep 5
@@ -328,7 +372,7 @@ jobs:
           . "$A/in.env" 2>/dev/null || true
           GRP="${GRP:-}"; SURL="${SURL:-}"
           if [ -x "$A/store_push.sh" ]; then
-            "$A/store_push.sh" "$GRP" "$SURL" "收工"
+            "$A/store_push.sh" "$GRP" "$SURL" "收工" 1200
             rc=$?
           else
             echo "::error::组存储: 推送助手不在 ($A/store_push.sh) → 本次不推(本轮改动不会被保存)"
